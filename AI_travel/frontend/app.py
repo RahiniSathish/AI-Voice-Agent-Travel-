@@ -2192,6 +2192,50 @@ def show_voice_chat_interface():
             let transcriptInterval = null;
             let lastTranscriptId = null;
             const renderedTranscriptIds = new Set();
+            const FINAL_TRANSCRIPT_DELAY_MS = 1200;
+
+            function delay(ms) {{
+                return new Promise(resolve => setTimeout(resolve, ms));
+            }}
+
+            async function loadFinalTranscript() {{
+                if (!roomName) {{
+                    return;
+                }}
+
+                try {{
+                    const url = `${{backendUrl}}/livekit/transcript/${{encodeURIComponent(roomName)}}?limit=500`;
+                    const response = await fetch(url);
+                    if (!response.ok) {{
+                        console.warn('Final transcript fetch failed', response.status);
+                        return;
+                    }}
+
+                    const data = await response.json();
+                    if (!data || !Array.isArray(data.transcripts)) {{
+                        updateTranscriptStatus('Transcript history unavailable.');
+                        return;
+                    }}
+
+                    if (!data.transcripts.length) {{
+                        updateTranscriptStatus('Transcript saved. No speech detected.');
+                        return;
+                    }}
+
+                    const transcriptContent = document.getElementById('transcriptContent');
+                    if (transcriptContent) {{
+                        transcriptContent.innerHTML = '';
+                    }}
+                    renderedTranscriptIds.clear();
+                    lastTranscriptId = null;
+
+                    renderTranscripts(data.transcripts);
+                    updateTranscriptStatus('Final transcript loaded from history.');
+                    console.log('Final transcript from DB', data.transcripts);
+                }} catch (error) {{
+                    console.warn('Failed to load final transcript', error);
+                }}
+            }}
 
             // Check if LiveKit SDK is loaded
             function checkLiveKitLoaded() {{
@@ -2324,7 +2368,7 @@ def show_voice_chat_interface():
                     }});
                     
                     room.on(window.LiveKitGlobal.RoomEvent.Disconnected, () => {{
-                        handleDisconnect();
+                        handleDisconnect(false).catch(error => console.warn('Handle disconnect error', error));
                     }});
                     
                     await room.connect(url, token);
@@ -2348,15 +2392,18 @@ def show_voice_chat_interface():
             
             async function disconnect() {{
                 if (room) {{
-                    room.disconnect();
+                    try {{
+                        await room.disconnect();
+                    }} catch (error) {{
+                        console.warn('Room disconnect error', error);
+                    }}
                     room = null;
                 }}
                 currentSessionId = null;
-                stopTranscriptPolling();
-                handleDisconnect();
+                await handleDisconnect(true);
             }}
 
-            function handleDisconnect() {{
+            async function handleDisconnect(userInitiated = false) {{
                 isConnected = false;
                 updateStatus("disconnected", "● Disconnected");
                 document.getElementById('connectBtn').style.display = 'block';
@@ -2364,7 +2411,11 @@ def show_voice_chat_interface():
                 document.getElementById('disconnectBtn').style.display = 'none';
                 document.getElementById('visualizer').classList.remove('visible');
                 stopTranscriptPolling();
-                updateTranscriptStatus('Disconnected');
+                updateTranscriptStatus('Call ended. Preparing transcript...');
+
+                // Allow some time for the final transcripts to be persisted
+                await delay(FINAL_TRANSCRIPT_DELAY_MS);
+                await loadFinalTranscript();
             }}
             
             function updateStatus(state, message) {{
@@ -2477,6 +2528,7 @@ def show_voice_chat_interface():
                         : entry.speaker === 'user' ? 'user'
                         : 'system';
 
+                    console.log('Transcript update', entry);
                     addTranscriptItem(speakerType, entry.text, entry.created_at);
                     renderedTranscriptIds.add(entry.id);
                     lastTranscriptId = entry.id;

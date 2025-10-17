@@ -931,6 +931,14 @@ async def record_livekit_transcript_endpoint(request: LiveKitTranscriptRequest):
         language = request.language or "en-US"
         timestamp = request.timestamp or datetime.now()
 
+        logger.info(
+            "📝 Transcript captured | room=%s speaker=%s session=%s text=%s",
+            request.room_name,
+            request.speaker,
+            session_id,
+            request.text
+        )
+
         save_conversation(
             customer_email,
             session_id,
