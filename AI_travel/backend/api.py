@@ -11,11 +11,12 @@ import tempfile
 import base64
 import logging
 from datetime import datetime
+from typing import Optional, Dict
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 # Import from local modules
 import sys
@@ -73,7 +74,11 @@ from database import (
     save_conversation,
     get_conversation_history,
     cancel_booking,
-    reschedule_booking
+    reschedule_booking,
+    record_livekit_session,
+    get_livekit_session,
+    update_livekit_session_activity,
+    get_livekit_transcript
 )
 
 # Initialize FastAPI
@@ -755,11 +760,25 @@ def test_password_verification(email: str, password: str):
 class LiveKitTokenRequest(BaseModel):
     roomName: str
     participantName: str
+    customerEmail: Optional[EmailStr] = None
+    sessionId: Optional[str] = None
+    metadata: Optional[Dict] = None
 
 
 class LiveKitTokenResponse(BaseModel):
     token: str
     url: str
+    sessionId: str
+
+
+class LiveKitTranscriptRequest(BaseModel):
+    room_name: str
+    speaker: str  # user, assistant, system
+    text: str
+    session_id: Optional[str] = None
+    customer_email: Optional[EmailStr] = None
+    language: Optional[str] = "en-US"
+    timestamp: Optional[datetime] = None
 
 
 async def _dispatch_agent_to_room(room_name: str, livekit_url: str, api_key: str, api_secret: str):
@@ -806,18 +825,39 @@ async def get_livekit_token(request: LiveKitTokenRequest):
                 status_code=500,
                 detail="LiveKit SDK not installed"
             )
-        
+
         # Get LiveKit credentials from environment
         livekit_url = os.getenv("LIVEKIT_URL")
         api_key = os.getenv("LIVEKIT_API_KEY")
         api_secret = os.getenv("LIVEKIT_API_SECRET")
-        
+
         if not all([livekit_url, api_key, api_secret]):
             raise HTTPException(
                 status_code=500,
                 detail="LiveKit credentials not configured"
             )
-        
+
+        # Generate or reuse a LiveKit session ID
+        session_id = request.sessionId or str(uuid.uuid4())
+
+        # Persist mapping for transcripts
+        try:
+            session_record = record_livekit_session(
+                room_name=request.roomName,
+                participant_name=request.participantName,
+                customer_email=request.customerEmail,
+                session_id=session_id,
+                metadata=request.metadata
+            )
+            logger.info(
+                "💾 LiveKit session stored: room=%s, session=%s, email=%s",
+                session_record.get('room_name', request.roomName),
+                session_record.get('session_id'),
+                session_record.get('customer_email')
+            )
+        except Exception as mapping_error:
+            logger.warning(f"⚠️ Failed to persist LiveKit session metadata: {mapping_error}")
+
         # Create token with permissions
         token = AccessToken(api_key, api_secret) \
             .with_identity(request.participantName) \
@@ -829,46 +869,126 @@ async def get_livekit_token(request: LiveKitTokenRequest):
                 can_subscribe=True,
                 can_publish_data=True,
             ))
-        
+
         # Generate JWT
         jwt_token = token.to_jwt()
-        
+
         logger.info(f"✅ LiveKit token generated for {request.participantName} in room {request.roomName}")
-        
+
         # CRITICAL: Dispatch agent to the room
         # This triggers the agent worker to join and handle voice conversations
         try:
             import aiohttp
             from livekit.api.agent_dispatch_service import AgentDispatchService, CreateAgentDispatchRequest
-            
-            # Create the agent dispatch request
+
             dispatch_request = CreateAgentDispatchRequest(
                 room=request.roomName,
-                agent_name="attar-travel-assistant",  # Must match WorkerOptions in agent.py
+                agent_name="attar-travel-assistant",
             )
-            
-            # Create agent dispatch service with aiohttp session
+
             api_url = livekit_url.replace('wss://', 'https://').replace('ws://', 'http://')
-            
+
             async with aiohttp.ClientSession() as session:
                 dispatch_service = AgentDispatchService(session, api_url, api_key, api_secret)
                 dispatch_response = await dispatch_service.create_dispatch(dispatch_request)
-            
+
             logger.info(f"🤖 Agent dispatched successfully to room {request.roomName}")
             logger.info(f"✅ Dispatch ID: {dispatch_response.id if hasattr(dispatch_response, 'id') else 'N/A'}")
-        
+
         except Exception as dispatch_error:
-            # Don't fail token generation if dispatch fails
             logger.error(f"❌ Agent dispatch failed: {str(dispatch_error)}")
-            logger.warning(f"💡 Make sure agent worker is running: python agent.py dev")
-        
+            logger.warning("💡 Make sure agent worker is running: python agent.py dev")
+
         return LiveKitTokenResponse(
             token=jwt_token,
-            url=livekit_url
+            url=livekit_url,
+            sessionId=session_id
         )
-        
+
     except Exception as e:
         logger.error(f"❌ Error generating LiveKit token: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/livekit/transcript")
+async def record_livekit_transcript_endpoint(request: LiveKitTranscriptRequest):
+    """Record a transcript message coming from the LiveKit voice agent."""
+    try:
+        if not request.text or not request.text.strip():
+            raise HTTPException(status_code=400, detail="Transcript text is required")
+
+        session_info = get_livekit_session(request.room_name)
+        session_id = request.session_id or (session_info.get('session_id') if session_info else None)
+        customer_email = request.customer_email or (session_info.get('customer_email') if session_info else None)
+
+        if not customer_email:
+            logger.warning("⚠️ Transcript received without customer email; using guest placeholder")
+            customer_email = "guest@livekit.local"
+
+        if not session_id:
+            session_id = request.room_name
+
+        language = request.language or "en-US"
+        timestamp = request.timestamp or datetime.now()
+
+        save_conversation(
+            customer_email,
+            session_id,
+            request.speaker,
+            request.text,
+            language,
+            timestamp
+        )
+
+        update_livekit_session_activity(
+            request.room_name,
+            customer_email=customer_email,
+            last_transcript_at=timestamp
+        )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "customer_email": customer_email,
+            "room_name": request.room_name,
+            "speaker": request.speaker,
+            "language": language,
+            "timestamp": timestamp.isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error recording LiveKit transcript: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/livekit/transcript/{room_name}")
+def get_livekit_transcript_endpoint(room_name: str, limit: int = 200, since_id: Optional[int] = None):
+    """Fetch transcript history for a LiveKit room."""
+    try:
+        transcript_data = get_livekit_transcript(room_name, limit, since_id)
+        transcript_data.update({"success": True})
+        return transcript_data
+    except Exception as e:
+        logger.error(f"❌ Error fetching LiveKit transcript: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/livekit/session-info/{room_name}")
+def get_livekit_session_info(room_name: str):
+    """Return stored metadata for a LiveKit session."""
+    try:
+        session_info = get_livekit_session(room_name)
+        if not session_info:
+            raise HTTPException(status_code=404, detail="LiveKit session not found")
+
+        session_info.update({"success": True})
+        return session_info
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error retrieving LiveKit session info: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
