@@ -497,28 +497,78 @@ def get_transcript_by_session(session_id: str, limit: int = 200,
     return transcripts
 
 
+def _get_customer_email_for_session(session_id: str) -> Optional[str]:
+    """Fetch the customer email associated with a transcript session."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT customer_email
+        FROM conversations
+        WHERE session_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (session_id,)
+    )
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return row[0]
+
+
 def get_livekit_transcript(room_name: str, limit: int = 200,
                            since_id: Optional[int] = None) -> Dict:
     """Get LiveKit transcript and associated session metadata."""
     session_info = get_livekit_session(room_name)
 
-    if not session_info or not session_info.get('session_id'):
+    # Prefer the stored session mapping, but fall back to room_name-based session
+    session_id: Optional[str] = None
+    customer_email: Optional[str] = None
+    participant_name: Optional[str] = None
+    last_transcript_at: Optional[datetime] = None
+
+    if session_info:
+        session_id = session_info.get('session_id') or None
+        customer_email = session_info.get('customer_email')
+        participant_name = session_info.get('participant_name')
+        last_transcript_at = session_info.get('last_transcript_at')
+
+    transcripts: List[Dict] = []
+
+    if session_id:
+        transcripts = get_transcript_by_session(session_id, limit, since_id)
+    else:
+        # Some sessions may not have been mapped yet; use room name as fallback ID
+        fallback_session_id = room_name
+        transcripts = get_transcript_by_session(fallback_session_id, limit, since_id)
+        if transcripts:
+            session_id = fallback_session_id
+            # Try to recover customer email from transcript entries
+            customer_email = customer_email or _get_customer_email_for_session(fallback_session_id)
+
+    # If we still have no transcripts, return minimal info
+    if not transcripts:
         return {
             'room_name': room_name,
-            'session_id': None,
-            'customer_email': session_info['customer_email'] if session_info else None,
+            'session_id': session_id,
+            'customer_email': customer_email,
+            'participant_name': participant_name,
             'transcripts': []
         }
 
-    transcripts = get_transcript_by_session(session_info['session_id'], limit, since_id)
-
     result = {
         'room_name': room_name,
-        'session_id': session_info['session_id'],
-        'customer_email': session_info.get('customer_email'),
-        'participant_name': session_info.get('participant_name'),
+        'session_id': session_id,
+        'customer_email': customer_email,
+        'participant_name': participant_name,
         'transcripts': transcripts,
-        'last_transcript_at': session_info.get('last_transcript_at')
+        'last_transcript_at': last_transcript_at
     }
 
     return result
