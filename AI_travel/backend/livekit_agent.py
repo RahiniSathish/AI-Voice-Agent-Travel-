@@ -6,11 +6,14 @@ Integrated with Attar Travel AI system
 
 import asyncio
 import logging
-from typing import Optional
+import os
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+import aiohttp
 from livekit import agents, rtc
 from livekit.agents import JobContext, WorkerOptions, cli, Agent, AgentSession
 from livekit.plugins import openai, silero
-import os
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -31,8 +34,140 @@ class AttarTravelVoiceAssistant:
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         if not self.openai_api_key:
             raise ValueError("OPENAI_API_KEY not found in environment variables")
-        
+
         logger.info("🤖 Attar Travel Voice Assistant initialized")
+        self.backend_url = self._resolve_backend_url()
+
+    def _resolve_backend_url(self) -> str:
+        for env_key in ("TRAVEL_BACKEND_URL", "BACKEND_API_URL", "BACKEND_URL"):
+            value = os.getenv(env_key)
+            if value:
+                return value.rstrip('/')
+        return "http://localhost:8000"
+
+    async def _fetch_session_info(self, room_name: str) -> Optional[Dict[str, Any]]:
+        if not self.backend_url:
+            return None
+
+        url = f"{self.backend_url}/livekit/session-info/{room_name}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        logger.info(
+                            "📡 Loaded LiveKit session info: room=%s, session=%s, email=%s",
+                            room_name,
+                            data.get("session_id"),
+                            data.get("customer_email")
+                        )
+                        return data
+                    else:
+                        logger.warning(
+                            "⚠️ LiveKit session info request failed (%s): HTTP %s",
+                            room_name,
+                            resp.status
+                        )
+        except Exception as error:
+            logger.warning(f"⚠️ Could not fetch session info for {room_name}: {error}")
+
+        return None
+
+    def _extract_text(self, message: Any) -> Optional[str]:
+        if message is None:
+            return None
+
+        if isinstance(message, str):
+            return message.strip() or None
+
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            content = content.strip()
+            if content:
+                return content
+
+        alternatives = getattr(message, "alternatives", None)
+        if alternatives:
+            first = alternatives[0] if isinstance(alternatives, (list, tuple)) and alternatives else None
+            if first:
+                text_value = getattr(first, "text", None)
+                if not text_value and isinstance(first, dict):
+                    text_value = first.get("text")
+                if text_value:
+                    text_value = text_value.strip()
+                    if text_value:
+                        return text_value
+
+        text_attr = getattr(message, "text", None)
+        if isinstance(text_attr, str) and text_attr.strip():
+            return text_attr.strip()
+
+        if isinstance(message, dict):
+            for key in ("text", "message", "content"):
+                value = message.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        try:
+            return str(message).strip()
+        except Exception:
+            return None
+
+    def _extract_language(self, message: Any) -> Optional[str]:
+        if message is None:
+            return None
+
+        for attr in ("language", "language_code", "detected_language"):
+            value = getattr(message, attr, None)
+            if isinstance(value, str) and value:
+                return value
+
+        if isinstance(message, dict):
+            for key in ("language", "language_code", "detected_language"):
+                value = message.get(key)
+                if isinstance(value, str) and value:
+                    return value
+
+        return None
+
+    async def _send_transcript(self, *, room_name: str, session_id: Optional[str],
+                               customer_email: Optional[str], speaker: str,
+                               text: str, language: Optional[str],
+                               context: Dict[str, Any]) -> None:
+        if not self.backend_url:
+            return
+
+        payload = {
+            "room_name": room_name,
+            "session_id": session_id,
+            "customer_email": customer_email,
+            "speaker": speaker,
+            "text": text,
+            "language": language or "en-US",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+        url = f"{self.backend_url}/livekit/transcript"
+        timeout = aiohttp.ClientTimeout(total=5)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status >= 300:
+                        error_text = await resp.text()
+                        logger.warning(
+                            "⚠️ Transcript save failed (%s): %s",
+                            resp.status,
+                            error_text
+                        )
+                    else:
+                        data = await resp.json()
+                        if isinstance(data, dict):
+                            context["session_id"] = data.get("session_id", context.get("session_id"))
+                            context["customer_email"] = data.get("customer_email", context.get("customer_email"))
+        except Exception as error:
+            logger.warning(f"⚠️ Unable to send transcript: {error}")
     
     async def entrypoint(self, ctx: JobContext):
         """
@@ -44,6 +179,25 @@ class AttarTravelVoiceAssistant:
         # Connect to the room
         await ctx.connect()
         logger.info(f"✅ Agent connected to room: {ctx.room.name}")
+
+        room_name = ctx.room.name
+        transcript_context: Dict[str, Any] = {
+            "room_name": room_name,
+            "session_id": None,
+            "customer_email": None,
+            "language": "en-US"
+        }
+
+        if self.backend_url:
+            logger.info(f"📝 Transcript backend: {self.backend_url}")
+            session_info = await self._fetch_session_info(room_name)
+            if session_info:
+                transcript_context["session_id"] = session_info.get("session_id")
+                transcript_context["customer_email"] = session_info.get("customer_email")
+                if session_info.get("metadata") and isinstance(session_info["metadata"], dict):
+                    language_hint = session_info["metadata"].get("language")
+                    if language_hint:
+                        transcript_context["language"] = language_hint
         
         # System instructions for the assistant
         initial_instructions = (
@@ -125,21 +279,44 @@ class AttarTravelVoiceAssistant:
         )
         
         # Set up event handlers for real-time streaming feedback
+        def _queue_transcript(speaker: str, raw_message: Any):
+            text = self._extract_text(raw_message)
+            if not text:
+                return
+
+            detected_language = self._extract_language(raw_message)
+            if detected_language:
+                transcript_context["language"] = detected_language
+
+            asyncio.create_task(
+                self._send_transcript(
+                    room_name=transcript_context["room_name"],
+                    session_id=transcript_context.get("session_id"),
+                    customer_email=transcript_context.get("customer_email"),
+                    speaker=speaker,
+                    text=text,
+                    language=transcript_context.get("language"),
+                    context=transcript_context
+                )
+            )
+
         @session.on("user_speech_started")
         def on_user_speech_started():
             logger.info("👂 User started speaking...")
-        
+
         @session.on("user_speech_committed")
         def on_user_speech_committed(message):
             logger.info(f"👤 User said: {message.content if hasattr(message, 'content') else message}")
-        
+            _queue_transcript("user", message)
+
         @session.on("agent_speech_started")
         def on_agent_speech_started():
             logger.info("🗣️ Agent started speaking...")
-        
+
         @session.on("agent_speech_committed")
         def on_agent_speech_committed(message):
             logger.info(f"🤖 Agent said: {message.content if hasattr(message, 'content') else message}")
+            _queue_transcript("assistant", message)
         
         @session.on("agent_speech_interrupted")
         def on_agent_interrupted():

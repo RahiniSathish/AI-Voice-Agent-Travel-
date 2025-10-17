@@ -7,6 +7,9 @@ from datetime import datetime
 from typing import Optional, List, Dict
 import json
 
+# Utility constant for timestamp formatting
+_NOW = datetime.now
+
 DB_PATH = "../database/customers.db"
 
 def init_database():
@@ -65,6 +68,21 @@ def init_database():
             message_text TEXT NOT NULL,
             language TEXT DEFAULT 'en-US',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # LiveKit session tracking table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS livekit_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            room_name TEXT UNIQUE NOT NULL,
+            session_id TEXT,
+            customer_email TEXT,
+            participant_name TEXT,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_transcript_at TIMESTAMP
         )
     """)
     
@@ -242,18 +260,21 @@ def get_guest_bookings(email: str) -> List[Dict]:
         })
     return legacy_bookings
 
-def save_conversation(customer_email: str, session_id: str, message_type: str, 
-                     message_text: str, language: str = 'en-US'):
+def save_conversation(customer_email: str, session_id: str, message_type: str,
+                     message_text: str, language: str = 'en-US',
+                     created_at: Optional[datetime] = None):
     """Save conversation message to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
+    timestamp = created_at or _NOW()
+
     cursor.execute("""
-        INSERT INTO conversations 
+        INSERT INTO conversations
         (customer_email, session_id, message_type, message_text, language, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (customer_email, session_id, message_type, message_text, language, datetime.now()))
-    
+    """, (customer_email, session_id, message_type, message_text, language, timestamp))
+
     conn.commit()
     conn.close()
 
@@ -262,18 +283,27 @@ def save_conversation_legacy(guest_email: str, session_id: str, message_type: st
                            message_text: str, language: str = 'en-US'):
     return save_conversation(guest_email, session_id, message_type, message_text, language)
 
-def get_conversation_history(customer_email: str, limit: int = 50) -> List[Dict]:
+def get_conversation_history(customer_email: str, limit: int = 50,
+                             session_id: Optional[str] = None) -> List[Dict]:
     """Get conversation history for a customer - pairs user messages with AI responses"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT message_type, message_text, language, created_at
+
+    query = """
+        SELECT id, message_type, message_text, language, created_at, session_id
         FROM conversations
         WHERE customer_email = ?
-        ORDER BY created_at ASC
-    """, (customer_email,))
-    
+    """
+    params = [customer_email]
+
+    if session_id:
+        query += " AND session_id = ?"
+        params.append(session_id)
+
+    query += " ORDER BY created_at ASC"
+
+    cursor.execute(query, tuple(params))
+
     all_messages = cursor.fetchall()
     conn.close()
     
@@ -282,17 +312,17 @@ def get_conversation_history(customer_email: str, limit: int = 50) -> List[Dict]
     i = 0
     while i < len(all_messages):
         msg = all_messages[i]
-        message_type = msg[0]
-        message_text = msg[1]
-        created_at = msg[3]
+        message_type = msg[1]
+        message_text = msg[2]
+        created_at = msg[4]
         
         if message_type == 'user':
             # Look for the next AI response
             ai_response = "No response"
             duration = "N/A"
             
-            if i + 1 < len(all_messages) and all_messages[i + 1][0] == 'assistant':
-                ai_response = all_messages[i + 1][1]
+            if i + 1 < len(all_messages) and all_messages[i + 1][1] == 'assistant':
+                ai_response = all_messages[i + 1][2]
                 i += 1  # Skip the AI response in next iteration
             
             conversations.append({
@@ -311,6 +341,187 @@ def get_conversation_history(customer_email: str, limit: int = 50) -> List[Dict]
 # Keep the old function name for backward compatibility
 def get_conversation_history_legacy(guest_email: str, limit: int = 50) -> List[Dict]:
     return get_conversation_history(guest_email, limit)
+
+
+def record_livekit_session(room_name: str, participant_name: str,
+                           customer_email: Optional[str] = None,
+                           session_id: Optional[str] = None,
+                           metadata: Optional[Dict] = None) -> Dict:
+    """Create or update a LiveKit session mapping."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    metadata_json = json.dumps(metadata) if metadata else None
+    now = _NOW()
+
+    cursor.execute("""
+        INSERT INTO livekit_sessions
+        (room_name, session_id, customer_email, participant_name, metadata, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(room_name) DO UPDATE SET
+            session_id = COALESCE(excluded.session_id, livekit_sessions.session_id),
+            customer_email = COALESCE(excluded.customer_email, livekit_sessions.customer_email),
+            participant_name = COALESCE(excluded.participant_name, livekit_sessions.participant_name),
+            metadata = COALESCE(excluded.metadata, livekit_sessions.metadata),
+            updated_at = ?
+    """, (room_name, session_id, customer_email, participant_name, metadata_json, now, now, now))
+
+    conn.commit()
+
+    cursor.execute("""
+        SELECT room_name, session_id, customer_email, participant_name, metadata,
+               created_at, updated_at, last_transcript_at
+        FROM livekit_sessions
+        WHERE room_name = ?
+    """, (room_name,))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return {}
+
+    metadata_loaded = json.loads(row[4]) if row[4] else None
+
+    return {
+        'room_name': row[0],
+        'session_id': row[1],
+        'customer_email': row[2],
+        'participant_name': row[3],
+        'metadata': metadata_loaded,
+        'created_at': row[5],
+        'updated_at': row[6],
+        'last_transcript_at': row[7]
+    }
+
+
+def get_livekit_session(room_name: str) -> Optional[Dict]:
+    """Fetch LiveKit session mapping for a room."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT room_name, session_id, customer_email, participant_name, metadata,
+               created_at, updated_at, last_transcript_at
+        FROM livekit_sessions
+        WHERE room_name = ?
+    """, (room_name,))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    metadata_loaded = json.loads(row[4]) if row[4] else None
+
+    return {
+        'room_name': row[0],
+        'session_id': row[1],
+        'customer_email': row[2],
+        'participant_name': row[3],
+        'metadata': metadata_loaded,
+        'created_at': row[5],
+        'updated_at': row[6],
+        'last_transcript_at': row[7]
+    }
+
+
+def update_livekit_session_activity(room_name: str,
+                                    customer_email: Optional[str] = None,
+                                    last_transcript_at: Optional[datetime] = None) -> None:
+    """Update session metadata when activity occurs."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    updates = ["updated_at = ?"]
+    params = [_NOW()]
+
+    if customer_email:
+        updates.append("customer_email = ?")
+        params.append(customer_email)
+
+    if last_transcript_at:
+        updates.append("last_transcript_at = ?")
+        params.append(last_transcript_at)
+
+    params.append(room_name)
+
+    cursor.execute(
+        f"UPDATE livekit_sessions SET {', '.join(updates)} WHERE room_name = ?",
+        tuple(params)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_transcript_by_session(session_id: str, limit: int = 200,
+                              since_id: Optional[int] = None) -> List[Dict]:
+    """Get ordered transcript entries for a LiveKit session."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = """
+        SELECT id, message_type, message_text, language, created_at
+        FROM conversations
+        WHERE session_id = ?
+    """
+    params: List = [session_id]
+
+    if since_id is not None:
+        query += " AND id > ?"
+        params.append(since_id)
+
+    query += " ORDER BY id ASC"
+
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor.execute(query, tuple(params))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    transcripts = []
+    for row in rows:
+        transcripts.append({
+            'id': row[0],
+            'speaker': row[1],
+            'text': row[2],
+            'language': row[3],
+            'created_at': row[4]
+        })
+
+    return transcripts
+
+
+def get_livekit_transcript(room_name: str, limit: int = 200,
+                           since_id: Optional[int] = None) -> Dict:
+    """Get LiveKit transcript and associated session metadata."""
+    session_info = get_livekit_session(room_name)
+
+    if not session_info or not session_info.get('session_id'):
+        return {
+            'room_name': room_name,
+            'session_id': None,
+            'customer_email': session_info['customer_email'] if session_info else None,
+            'transcripts': []
+        }
+
+    transcripts = get_transcript_by_session(session_info['session_id'], limit, since_id)
+
+    result = {
+        'room_name': room_name,
+        'session_id': session_info['session_id'],
+        'customer_email': session_info.get('customer_email'),
+        'participant_name': session_info.get('participant_name'),
+        'transcripts': transcripts,
+        'last_transcript_at': session_info.get('last_transcript_at')
+    }
+
+    return result
 
 def cancel_booking(booking_id: int, customer_email: str) -> Dict:
     """Cancel a booking"""

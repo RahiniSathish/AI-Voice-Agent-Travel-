@@ -8,6 +8,7 @@ import requests
 import base64
 import tempfile
 import os
+import json
 from datetime import datetime, date, timedelta
 import time
 import threading
@@ -2009,6 +2010,69 @@ def show_voice_chat_interface():
         .disconnect-btn:hover {{
             background: #dc2626;
         }}
+        .transcript-container {{
+            margin-top: 1.5rem;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 1rem;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+            border: 1px solid rgba(15, 23, 42, 0.08);
+        }}
+        .transcript-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.75rem;
+        }}
+        .transcript-header h3 {{
+            margin: 0;
+            font-size: 1.1rem;
+            color: #1e293b;
+        }}
+        .transcript-status {{
+            font-size: 0.8rem;
+            color: #475569;
+        }}
+        .transcript-content {{
+            max-height: 250px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }}
+        .transcript-item {{
+            background: #f8fafc;
+            border-radius: 10px;
+            padding: 0.75rem;
+            border-left: 4px solid #6366f1;
+            box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.1);
+        }}
+        .transcript-item.user {{
+            border-left-color: #0ea5e9;
+        }}
+        .transcript-item.agent {{
+            border-left-color: #8b5cf6;
+        }}
+        .transcript-item.system {{
+            border-left-color: #f59e0b;
+        }}
+        .transcript-label {{
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #475569;
+            margin-bottom: 0.25rem;
+        }}
+        .transcript-message {{
+            font-size: 0.95rem;
+            color: #1e293b;
+            line-height: 1.4;
+        }}
+        .transcript-time {{
+            font-size: 0.75rem;
+            color: #94a3b8;
+            margin-top: 0.35rem;
+        }}
             .info {{
                 background: #f0f9ff;
                 padding: 1rem;
@@ -2072,8 +2136,16 @@ def show_voice_chat_interface():
                     End call
                 </button>
             </div>
+
+            <div class="transcript-container" id="transcriptContainer">
+                <div class="transcript-header">
+                    <h3>Conversation Transcript</h3>
+                    <span id="transcriptStatus" class="transcript-status">Waiting to start...</span>
+                </div>
+                <div id="transcriptContent" class="transcript-content"></div>
+            </div>
         </div>
-        
+
         <script>
             // Try multiple possible global variable names
             window.LiveKitGlobalCheck = function() {{
@@ -2114,6 +2186,12 @@ def show_voice_chat_interface():
             let isConnected = false;
             const roomName = '{room_name}';
             const participantName = '{participant_name}';
+            const backendUrl = {backend_url_json};
+            const customerEmail = {customer_email_json};
+            let currentSessionId = null;
+            let transcriptInterval = null;
+            let lastTranscriptId = null;
+            const renderedTranscriptIds = new Set();
 
             // Check if LiveKit SDK is loaded
             function checkLiveKitLoaded() {{
@@ -2155,13 +2233,28 @@ def show_voice_chat_interface():
             }}
             
             async function getToken() {{
-                const response = await fetch('http://localhost:8000/livekit/get-token', {{
+                const payload = {{
+                    roomName: roomName,
+                    participantName: participantName,
+                    customerEmail: customerEmail || null
+                }};
+
+                if (currentSessionId) {{
+                    payload.sessionId = currentSessionId;
+                }}
+
+                const response = await fetch(`${{backendUrl}}/livekit/get-token`, {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ roomName: roomName, participantName: participantName }})
+                    body: JSON.stringify(payload)
                 }});
+
+                if (!response.ok) {{
+                    throw new Error(`Token request failed with status ${{response.status}}`);
+                }}
+
                 const data = await response.json();
-                return {{ token: data.token, url: data.url }};
+                return {{ token: data.token, url: data.url, sessionId: data.sessionId }};
             }}
             
             async function connect() {{
@@ -2179,8 +2272,18 @@ def show_voice_chat_interface():
                     updateStatus("connecting", "● Connecting...");
                     document.getElementById('connectBtn').disabled = true;
                     
-                    const {{ token, url }} = await getToken();
-                    
+                    const {{ token, url, sessionId }} = await getToken();
+                    currentSessionId = sessionId || null;
+                    lastTranscriptId = null;
+                    renderedTranscriptIds.clear();
+
+                    const transcriptContent = document.getElementById('transcriptContent');
+                    if (transcriptContent) {{
+                        transcriptContent.innerHTML = '';
+                    }}
+                    updateTranscriptStatus('Connected. Listening for conversation...');
+                    startTranscriptPolling();
+
                     room = new window.LiveKitGlobal.Room({{
                         adaptiveStream: true,
                         dynacast: true,
@@ -2238,6 +2341,8 @@ def show_voice_chat_interface():
                     alert("Failed to connect: " + error.message);
                     updateStatus("disconnected", "● Disconnected");
                     document.getElementById('connectBtn').disabled = false;
+                    stopTranscriptPolling();
+                    updateTranscriptStatus('Connection failed');
                 }}
             }}
             
@@ -2246,9 +2351,11 @@ def show_voice_chat_interface():
                     room.disconnect();
                     room = null;
                 }}
+                currentSessionId = null;
+                stopTranscriptPolling();
                 handleDisconnect();
             }}
-            
+
             function handleDisconnect() {{
                 isConnected = false;
                 updateStatus("disconnected", "● Disconnected");
@@ -2256,12 +2363,126 @@ def show_voice_chat_interface():
                 document.getElementById('connectBtn').disabled = false;
                 document.getElementById('disconnectBtn').style.display = 'none';
                 document.getElementById('visualizer').classList.remove('visible');
+                stopTranscriptPolling();
+                updateTranscriptStatus('Disconnected');
             }}
             
             function updateStatus(state, message) {{
                 const statusEl = document.getElementById('status');
                 statusEl.className = 'status ' + state;
                 statusEl.textContent = message;
+            }}
+
+            function updateTranscriptStatus(message) {{
+                const statusEl = document.getElementById('transcriptStatus');
+                if (statusEl) {{
+                    statusEl.textContent = message;
+                }}
+            }}
+
+            function stopTranscriptPolling() {{
+                if (transcriptInterval) {{
+                    clearInterval(transcriptInterval);
+                    transcriptInterval = null;
+                }}
+            }}
+
+            async function fetchTranscriptUpdates() {{
+                if (!currentSessionId) {{
+                    return;
+                }}
+
+                try {{
+                    let url = `${{backendUrl}}/livekit/transcript/${{encodeURIComponent(roomName)}}?limit=200`;
+                    if (lastTranscriptId !== null) {{
+                        url += `&since_id=${{lastTranscriptId}}`;
+                    }}
+
+                    const response = await fetch(url);
+                    if (!response.ok) {{
+                        if (response.status !== 404) {{
+                            console.warn('Transcript fetch failed', response.status);
+                        }}
+                        return;
+                    }}
+
+                    const data = await response.json();
+                    if (data && Array.isArray(data.transcripts)) {{
+                        renderTranscripts(data.transcripts);
+                    }}
+                }} catch (error) {{
+                    console.warn('Transcript polling error', error);
+                }}
+            }}
+
+            function startTranscriptPolling() {{
+                stopTranscriptPolling();
+                fetchTranscriptUpdates();
+                transcriptInterval = setInterval(fetchTranscriptUpdates, 4000);
+            }}
+
+            function addTranscriptItem(type, message, timestamp) {{
+                const container = document.getElementById('transcriptContent');
+                if (!container) {{
+                    return;
+                }}
+
+                const item = document.createElement('div');
+                item.className = `transcript-item ${{type}}`;
+
+                const label = document.createElement('div');
+                label.className = 'transcript-label';
+
+                if (type === 'user') {{
+                    label.textContent = '👤 You';
+                }} else if (type === 'agent') {{
+                    label.textContent = '🤖 Alex';
+                }} else {{
+                    label.textContent = 'ℹ️ System';
+                }}
+
+                const textDiv = document.createElement('div');
+                textDiv.className = 'transcript-message';
+                textDiv.textContent = message;
+
+                item.appendChild(label);
+                item.appendChild(textDiv);
+
+                if (timestamp) {{
+                    const timeDiv = document.createElement('div');
+                    timeDiv.className = 'transcript-time';
+                    timeDiv.textContent = new Date(timestamp).toLocaleTimeString();
+                    item.appendChild(timeDiv);
+                }}
+
+                container.appendChild(item);
+                container.scrollTop = container.scrollHeight;
+            }}
+
+            function renderTranscripts(entries) {{
+                if (!Array.isArray(entries)) {{
+                    return;
+                }}
+
+                let newMessages = 0;
+                entries.forEach(entry => {{
+                    if (!entry || renderedTranscriptIds.has(entry.id)) {{
+                        return;
+                    }}
+
+                    const speakerType = entry.speaker === 'assistant' ? 'agent'
+                        : entry.speaker === 'user' ? 'user'
+                        : 'system';
+
+                    addTranscriptItem(speakerType, entry.text, entry.created_at);
+                    renderedTranscriptIds.add(entry.id);
+                    lastTranscriptId = entry.id;
+                    newMessages += 1;
+                }});
+
+                if (newMessages > 0) {{
+                    updateTranscriptStatus('Transcript updated just now');
+                }}
             }}
         </script>
     </body>
@@ -2270,7 +2491,12 @@ def show_voice_chat_interface():
     
     # Format the HTML with the actual values
     try:
-        livekit_html_formatted = livekit_html.format(room_name=room_name, participant_name=participant_name)
+        livekit_html_formatted = livekit_html.format(
+            room_name=room_name,
+            participant_name=participant_name,
+            backend_url_json=json.dumps(BACKEND_URL),
+            customer_email_json=json.dumps(customer_email)
+        )
     except KeyError as e:
         st.error(f"Error formatting template: {str(e)}")
         return
