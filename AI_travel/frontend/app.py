@@ -2388,7 +2388,7 @@ def show_voice_chat_interface():
             }}
 
             async function fetchTranscriptUpdates() {{
-                if (!currentSessionId) {{
+                if (!roomName) {{
                     return;
                 }}
 
@@ -2407,6 +2407,9 @@ def show_voice_chat_interface():
                     }}
 
                     const data = await response.json();
+                    if (!currentSessionId && data && data.session_id) {{
+                        currentSessionId = data.session_id;
+                    }}
                     if (data && Array.isArray(data.transcripts)) {{
                         renderTranscripts(data.transcripts);
                     }}
